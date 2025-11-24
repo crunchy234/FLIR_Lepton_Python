@@ -1,0 +1,14 @@
+# FLIR Lepton 3.5 Python Library Requirements
+
+# SPI communication
+spidev>=3.5
+
+# Numerical computing and array operations
+numpy>=1.21.0
+
+# Optional: For image processing and display
+# opencv-python>=4.5.0  # Uncomment if you need OpenCV for display/processing
+# Pillow>=8.0.0  # Uncomment if you need PIL for image handling
+
+# Optional: For I2C communication (future CCI implementation)
+# smbus2>=0.4.0  # Uncomment for I2C/CCI control features
