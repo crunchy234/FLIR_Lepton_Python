@@ -1,0 +1,2 @@
+- Create a Python script that can be used as a library to interface FLIR Lepton 3.5 thermal camera with Raspberry Pi 5 and NVIDIA Jetson Orin Nano.
+- Create another Python script that can import the previous script as a module and stream thermal feed from the camera. It should also have the capability to assert the shape of a people, put an enclosing box on them and maintain a count of them.
