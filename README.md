@@ -4,6 +4,7 @@ A Python library for interfacing with the FLIR Lepton 3.5 thermal camera on Rasp
 
 ## Features
 
+### Core Library
 - **Easy-to-use Python API** for thermal image capture
 - **SPI communication** for high-speed image data transfer
 - **Platform detection** - automatically configures for Raspberry Pi 5 or Jetson Orin Nano
@@ -12,6 +13,14 @@ A Python library for interfacing with the FLIR Lepton 3.5 thermal camera on Rasp
 - **Stream support** - generator-based continuous frame capture
 - **Context manager support** - proper resource cleanup
 - **Error handling** - custom exceptions for better debugging
+
+### People Detection Applications
+- **Real-time people detection** - detect and track people using thermal signatures
+- **Multi-person tracking** - track multiple people with unique IDs
+- **People counting** - maintain current count and total count
+- **Bounding box visualization** - draw boxes around detected people
+- **Configurable detection** - tune parameters for your environment
+- **Simple and advanced modes** - beginner-friendly and full-featured options
 
 ## Hardware Specifications
 
@@ -64,6 +73,10 @@ Connect the FLIR Lepton 3.5 to your device:
 | 7          | SCL      | GPIO 3    | I2C0_SCL   |
 
 ## Quick Start
+
+### Library Usage
+
+The library can be imported and used in your own scripts:
 
 ### Basic Usage
 
@@ -134,6 +147,105 @@ with FLIRLepton35() as camera:
         print(f"Raw thermal values: {thermal_data.dtype}")
         print(f"Min: {thermal_data.min()}, Max: {thermal_data.max()}")
 ```
+
+## People Detection and Counting
+
+The repository includes ready-to-use scripts for detecting and counting people using thermal imaging:
+
+### Thermal People Counter (Advanced)
+
+Full-featured people detection system with tracking and counting:
+
+```bash
+python thermal_people_counter.py
+```
+
+**Features:**
+- Real-time people detection using thermal blob analysis
+- Multi-person tracking with unique IDs
+- Tracking trails showing movement paths
+- Current count and total count statistics
+- Configurable detection parameters
+- Screenshot capture capability
+
+**Controls:**
+- `Q` - Quit
+- `R` - Reset counter
+- `S` - Save screenshot
+
+**Command-line options:**
+```bash
+python thermal_people_counter.py --help
+
+Options:
+  --min-area 100         Minimum blob area for detection
+  --max-area 4000        Maximum blob area for detection
+  --min-temp 20          Minimum temperature threshold
+  --max-missing 10       Max frames before person considered gone
+  --scale 4              Display scale factor
+  --spi-bus 0            SPI bus number
+  --spi-device 0         SPI device number
+```
+
+### Simple People Detection (Beginner-Friendly)
+
+Simplified version for learning and customization:
+
+```bash
+python example_simple_people_detection.py
+```
+
+**Features:**
+- Easy-to-understand code structure
+- Real-time warm object detection
+- Bounding boxes on detected objects
+- Live count display
+- Adjustable temperature threshold
+
+**Controls:**
+- `Q` - Quit
+- `+` - Increase temperature threshold
+- `-` - Decrease temperature threshold
+- `S` - Save screenshot
+
+**Example code using the library:**
+
+```python
+from flir_lepton import FLIRLepton35
+import cv2
+
+with FLIRLepton35() as camera:
+    for frame in camera.get_frame_stream(normalize=True):
+        # Your detection algorithm here
+        # frame is a 120x160 numpy array (0-255)
+
+        # Example: threshold for hot objects
+        _, binary = cv2.threshold(frame, 30, 255, cv2.THRESH_BINARY)
+
+        # Find contours and draw boxes
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            # Draw box, count, analyze...
+```
+
+### Detection Tuning Tips
+
+For optimal people detection:
+
+1. **Temperature Threshold**: Adjust based on environment
+   - Cold environment: Lower threshold (15-25)
+   - Warm environment: Higher threshold (30-50)
+
+2. **Area Filtering**: Tune based on distance to camera
+   - Close range: Increase `max_area` (4000-8000)
+   - Far range: Decrease `min_area` (50-100)
+
+3. **Tracking Parameters**: Adjust for movement speed
+   - Fast movement: Increase `max_distance` (50-100)
+   - Slow movement: Decrease `max_missing_frames` (5-10)
+
+4. **Lighting Conditions**: Thermal imaging works in complete darkness, but reflective surfaces and direct sunlight can affect readings
 
 ## API Reference
 
