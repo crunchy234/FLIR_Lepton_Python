@@ -49,7 +49,8 @@ class FLIRLepton35:
         IMAGE_WIDTH (int): Image width in pixels (160)
         IMAGE_HEIGHT (int): Image height in pixels (120)
         PACKET_SIZE (int): Size of each SPI packet in bytes
-        PACKETS_PER_FRAME (int): Number of packets per frame
+        PACKETS_PER_SEGMENT (int): Number of packets per segment
+        SEGMENTS_PER_FRAME (int): Number of segments per frame
         FRAME_SIZE (int): Total frame size in bytes
     """
 
@@ -57,8 +58,9 @@ class FLIRLepton35:
     IMAGE_WIDTH = 160
     IMAGE_HEIGHT = 120
     PACKET_SIZE = 164  # 4 bytes header + 160 bytes data
-    PACKETS_PER_FRAME = 60  # For Lepton 3.x
-    FRAME_SIZE = PACKET_SIZE * PACKETS_PER_FRAME
+    PACKETS_PER_SEGMENT = 60  # Lepton 3.x uses 4 segments per frame
+    SEGMENTS_PER_FRAME = 4
+    FRAME_SIZE = PACKET_SIZE * PACKETS_PER_SEGMENT * SEGMENTS_PER_FRAME
 
     # SPI packet format
     PACKET_HEADER_SIZE = 4
@@ -149,12 +151,12 @@ class FLIRLepton35:
         except Exception as e:
             raise LeptonCommunicationError(f"Failed to initialize SPI: {str(e)}")
 
-    def _read_packet(self) -> Tuple[int, bytes]:
+    def _read_packet(self) -> Tuple[int, int, int, bytes]:
         """
         Read a single packet from the Lepton via SPI.
 
         Returns:
-            Tuple of (packet_number, packet_data)
+            Tuple of (packet_id, segment_id, packet_number, packet_data)
 
         Raises:
             LeptonCommunicationError: If packet read fails
@@ -166,11 +168,12 @@ class FLIRLepton35:
             # Byte 0 contains ID field, Byte 1 contains CRC
             packet_id = packet[0]
             packet_number = packet[1]
+            segment_id = (packet_id >> 4) & 0x07
 
             # Extract data portion (skip 4-byte header)
             packet_data = packet[self.PACKET_HEADER_SIZE:]
 
-            return packet_number, packet_data
+            return packet_id, segment_id, packet_number, packet_data
         except Exception as e:
             raise LeptonCommunicationError(f"Failed to read SPI packet: {str(e)}")
 
@@ -187,57 +190,58 @@ class FLIRLepton35:
         """
         for retry in range(max_retries):
             try:
-                # Initialize frame buffer
-                frame_data = []
-                packet_count = 0
+                # Initialize segment buffers
+                segments = {
+                    1: [None] * self.PACKETS_PER_SEGMENT,
+                    2: [None] * self.PACKETS_PER_SEGMENT,
+                    3: [None] * self.PACKETS_PER_SEGMENT,
+                    4: [None] * self.PACKETS_PER_SEGMENT,
+                }
+                segments_seen = set()
                 discard_count = 0
+                packets_read = 0
+                max_packets = self.PACKETS_PER_SEGMENT * self.SEGMENTS_PER_FRAME * 5
 
                 # Read packets until we get a complete frame
-                while packet_count < self.PACKETS_PER_FRAME:
-                    packet_number, packet_data = self._read_packet()
+                while packets_read < max_packets:
+                    packet_id, segment_id, packet_number, packet_data = self._read_packet()
+                    packets_read += 1
 
                     # Check for discard packet (resync needed)
-                    if (packet_number & 0x0F) == self.DISCARD_PACKET_ID:
+                    if (packet_id & 0x0F) == self.DISCARD_PACKET_ID:
                         discard_count += 1
                         if discard_count > 750:  # Timeout after many discards
                             break
                         time.sleep(0.001)  # Short delay for resync
                         continue
 
-                    # Check if this is the start of a new frame (packet 0)
+                    if segment_id not in segments:
+                        continue
+
                     if packet_number == 0:
-                        frame_data = []
-                        packet_count = 0
+                        segments[segment_id] = [None] * self.PACKETS_PER_SEGMENT
+                        segments_seen.add(segment_id)
 
-                    # Add packet data to frame
-                    frame_data.append(packet_data)
-                    packet_count += 1
+                    if packet_number < self.PACKETS_PER_SEGMENT:
+                        segments[segment_id][packet_number] = packet_data
 
-                # Check if we got a complete frame
-                if packet_count == self.PACKETS_PER_FRAME:
-                    # Convert frame data to numpy array
-                    # Each packet contains 80 16-bit values (160 bytes)
-                    frame_bytes = b''.join(frame_data)
+                    if len(segments_seen) == self.SEGMENTS_PER_FRAME:
+                        if all(all(p is not None for p in segments[sid]) for sid in segments_seen):
+                            break
 
-                    # Convert to 16-bit unsigned integers (big-endian)
-                    frame_array = np.frombuffer(frame_bytes, dtype='>u2')
+                # Check if we got a complete frame across all segments
+                if len(segments_seen) == self.SEGMENTS_PER_FRAME and all(
+                    all(p is not None for p in segments[sid]) for sid in segments_seen
+                ):
+                    segment_arrays = {}
+                    for sid in range(1, self.SEGMENTS_PER_FRAME + 1):
+                        segment_bytes = b''.join(segments[sid])
+                        segment_array = np.frombuffer(segment_bytes, dtype='>u2')
+                        segment_arrays[sid] = segment_array.reshape((self.PACKETS_PER_SEGMENT, 80))
 
-                    # Reshape to image dimensions
-                    # We have 60 packets * 80 values = 4800 values
-                    # But Lepton 3 uses telemetry, so actual image is 120x160
-                    # The first 3 rows are telemetry data for Lepton 3.x
-                    frame_array = frame_array.reshape((self.PACKETS_PER_FRAME, 80))
-
-                    # Extract only the image data (skip telemetry rows)
-                    # For Lepton 3.5, packets 0-2 are telemetry, 3-62 are image
-                    # But in simple mode, packets 0-59 are all image data
-                    # Take the middle 120 rows
-                    if frame_array.shape[0] >= self.IMAGE_HEIGHT:
-                        image_data = frame_array[:self.IMAGE_HEIGHT, :self.IMAGE_WIDTH]
-                    else:
-                        # Pad if necessary
-                        image_data = np.zeros((self.IMAGE_HEIGHT, self.IMAGE_WIDTH), dtype=np.uint16)
-                        image_data[:frame_array.shape[0], :frame_array.shape[1]] = frame_array
+                    top = np.hstack((segment_arrays[1], segment_arrays[2]))
+                    bottom = np.hstack((segment_arrays[3], segment_arrays[4]))
+                    image_data = np.vstack((top, bottom))
 
                     return image_data
 
