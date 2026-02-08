@@ -152,128 +152,106 @@ class FLIRLepton35:
         except Exception as e:
             raise LeptonCommunicationError(f"Failed to initialize SPI: {str(e)}")
 
-    def _read_packet(self) -> Tuple[int, int, int, bytes]:
+    def _resync_vospi(self):
         """
-        Read a single packet from the Lepton via SPI.
-
-        Returns:
-            Tuple of (packet_id, segment_id, packet_number, packet_data)
-
-        Raises:
-            LeptonCommunicationError: If packet read fails
+        Force a VoSPI resync by deasserting CS for at least 185ms.
+        The Lepton requires this to reset its VoSPI state machine.
         """
-        try:
-            # Use xfer2 for more consistent timing on Pi 5
-            packet = bytes(self.spi.xfer2([0] * self.PACKET_SIZE))
+        self.spi.close()
+        time.sleep(0.2)
+        self.spi.open(self.spi_bus, self.spi_device)
+        self.spi.max_speed_hz = self.spi_speed_hz
+        self.spi.mode = 3
+        self.spi.bits_per_word = 8
 
-            # Extract packet number from header
-            # Byte 0 and 1 contain ID field (16 bits)
-            # Bits 15-12: reserved
-            # Bits 11-8: segment ID (if packet 20)
-            # Bits 7-0: packet number
-            
-            # However, Lepton header is Big Endian
-            # [0] is ID MSB, [1] is ID LSB (packet number)
-            # Wait, standard VoSPI:
-            # Byte 0: ID MSB (reserved:4, segment:4) - actually segment is bits 4-6
-            # Byte 1: ID LSB (packet number)
-            # Byte 2-3: CRC
-            
-            packet_id = packet[0]
-            packet_number = packet[1]
-            
-            # The VoSPI spec says:
-            # If (packet[0] & 0x0F) == 0x0F, it's a discard packet.
-            
-            return packet_id, 0, packet_number, packet[self.PACKET_HEADER_SIZE:]
-        except Exception as e:
-            raise LeptonCommunicationError(f"Failed to read SPI packet: {str(e)}")
+    def _read_packet_raw(self) -> bytearray:
+        """Read a single 164-byte VoSPI packet."""
+        return bytearray(self.spi.readbytes(self.PACKET_SIZE))
 
     def _capture_frame_raw(self, max_retries: int = 50, debug: bool = False) -> Optional[np.ndarray]:
         """
         Capture a raw frame from the Lepton camera.
+
+        Strategy:
+        1. Resync VoSPI on startup and after repeated failures
+        2. Read one packet at a time to find packet 0 (sync)
+        3. Once synced, read remaining 59 packets of the segment
+        4. Collect all 4 segments to assemble a full frame
         """
         for retry in range(max_retries):
             try:
-                segments = {1: None, 2: None, 3: None, 4: None}
+                # Resync periodically to recover from persistent desync
+                if retry % 10 == 0:
+                    if debug and retry > 0:
+                        print(f"Resync VoSPI (retry {retry})")
+                    self._resync_vospi()
+                    time.sleep(0.05)
+
+                segments = {}
                 segments_seen = set()
-                
-                # Lepton 3.5 sends 4 segments to form one 160x120 frame
-                # We need to collect all 4 unique segments
-                
-                max_packets_to_read = self.PACKETS_PER_SEGMENT * 20 # Safety margin
-                packets_read_total = 0
-                
-                while len(segments_seen) < 4 and packets_read_total < max_packets_to_read:
-                    # Read packets until we find a valid packet 0
-                    pkt0_raw = self.spi.xfer2([0] * self.PACKET_SIZE)
-                    packets_read_total += 1
-                    
-                    # If it's a discard packet, skip it
-                    if (pkt0_raw[0] & 0x0F) == 0x0F:
+                discard_count = 0
+                max_discards = 600  # ~2.5 full frames worth of packets
+
+                while len(segments_seen) < 4 and discard_count < max_discards:
+                    # Step 1: Read packets one at a time until we find packet 0
+                    pkt = self._read_packet_raw()
+                    discard_count += 1
+
+                    # Skip discard packets
+                    if (pkt[0] & 0x0F) == 0x0F:
                         continue
-                        
-                    # Packet number is in the second byte
-                    if pkt0_raw[1] != 0:
-                        # If we're not at the start of a segment, keep looking
-                        # Small delay helps avoid hammering the SPI bus if out of sync
-                        time.sleep(0.001)
+
+                    # Not packet 0 — skip and keep looking
+                    if pkt[1] != 0:
                         continue
-                        
-                    # Found packet 0, now read the rest of the segment (60 packets total)
-                    current_segment_packets = [pkt0_raw]
-                    valid_segment = True
+
+                    # Found packet 0! Now read the remaining 59 packets
+                    segment_packets = [pkt]
+                    valid = True
                     segment_id = -1
-                    
-                    for i in range(1, 60):
-                        pkt = self.spi.xfer2([0] * self.PACKET_SIZE)
-                        packets_read_total += 1
-                        if pkt[1] != i:
+
+                    for i in range(1, self.PACKETS_PER_SEGMENT):
+                        next_pkt = self._read_packet_raw()
+                        discard_count += 1
+
+                        if next_pkt[1] != i:
                             if debug:
-                                print(f"Sync lost: expected packet {i}, got {pkt[1]}")
-                            valid_segment = False
+                                print(f"Sync lost at packet {i}: expected {i}, got {next_pkt[1]}")
+                            valid = False
                             break
-                        current_segment_packets.append(pkt)
+
+                        segment_packets.append(next_pkt)
+
+                        # Extract segment ID from packet 20
                         if i == 20:
-                            # Segment ID is in bits 4-6 of the first byte of packet 20
-                            segment_id = (pkt[0] >> 4) & 0x07 # 0x07 because it's 3 bits (1-4)
-                    
-                    if not valid_segment:
-                        # If sync was lost, wait a bit and look for the next packet 0
-                        time.sleep(0.001)
+                            segment_id = (next_pkt[0] >> 4) & 0x07
+
+                    if not valid:
                         continue
-                    
-                    # Validate segment ID (must be 1, 2, 3, or 4 for Lepton 3.x)
+
+                    # Validate segment ID (must be 1-4 for Lepton 3.x)
                     if segment_id < 1 or segment_id > 4:
                         continue
-                        
+
                     if segment_id not in segments_seen:
-                        segments[segment_id] = current_segment_packets
+                        segments[segment_id] = segment_packets
                         segments_seen.add(segment_id)
                         if debug:
                             print(f"Captured segment {segment_id}")
-                
+
                 if len(segments_seen) == 4:
                     # Assemble the 160x120 frame from the 4 segments
                     image_data = np.zeros((self.IMAGE_HEIGHT, self.IMAGE_WIDTH), dtype=np.uint16)
-                    
+
                     for sid in range(1, 5):
-                        packets = segments[sid]
-                        for p_idx, pkt in enumerate(packets):
-                            # Each packet has 160 bytes of data (80 pixels)
-                            # Row calculation for Lepton 3.5:
-                            # Each segment has 60 packets. 
-                            # Each row (160 pixels) is split across two packets.
-                            # So 60 packets / 2 = 30 rows per segment.
-                            # 30 rows * 4 segments = 120 rows total.
-                            
+                        for p_idx, pkt in enumerate(segments[sid]):
                             row = (p_idx // 2) + (sid - 1) * 30
                             col_start = 80 * (p_idx % 2)
-                            
+
                             packet_data = pkt[self.PACKET_HEADER_SIZE:]
                             row_pixels = np.frombuffer(bytes(packet_data), dtype='>u2')
-                            image_data[row, col_start:col_start+80] = row_pixels
-                            
+                            image_data[row, col_start:col_start + 80] = row_pixels
+
                     return image_data
                 elif debug:
                     print(f"Failed to capture all segments. Seen: {segments_seen}")

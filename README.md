@@ -112,27 +112,55 @@ with FLIRLepton35() as camera:
 
 ### Display Thermal Video (with OpenCV)
 
-```python
-import cv2
-from flir_lepton import FLIRLepton35
-
-with FLIRLepton35() as camera:
-    for frame in camera.get_frame_stream(normalize=True):
-        # Apply colormap for better visualization
-        colored_frame = cv2.applyColorMap(frame, cv2.COLORMAP_JET)
-
-        # Resize for better viewing
-        display_frame = cv2.resize(colored_frame, (640, 480))
-
-        # Display
-        cv2.imshow('FLIR Lepton 3.5', display_frame)
-
-        # Press 'q' to quit
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cv2.destroyAllWindows()
+```bash
+python example_video_stream.py
 ```
+
+### Stream Thermal Video over RTSP
+
+```bash
+python example_rtsp_stream.py
+```
+
+**Note:** RTSP streaming requires GStreamer system libraries. If you encounter errors during installation or execution, follow these steps:
+
+1. **Install System Dependencies:**
+   ```bash
+   sudo apt-get update
+   sudo apt install libgirepository-2.0-dev gcc libcairo2-dev pkg-config python3-dev gstreamer1.0-plugins-ugly gstreamer1.0-tools
+   ```
+
+   *If you are using a virtual environment, it **must** be created with system site packages enabled to access the GStreamer bindings, or you must install the development headers before creating the venv:*
+   ```bash
+   # Create a new venv with system access
+   python3 -m venv --system-site-packages .venv
+   ```
+
+2. **Install PyGObject:**
+   ```bash
+   pip install PyGObject
+   ```
+
+3. **Install OpenCV:**
+   ```bash
+   pip install opencv-python
+   ```
+
+### Troubleshooting PyGObject Installation
+
+If `pip install PyGObject` still fails with `Dependency 'girepository-2.0' is required but not found`:
+
+1. **Verify pkg-config can see the library:**
+   ```bash
+   pkg-config --modversion girepository-1.0
+   ```
+   *Note: On many systems, the package is named `girepository-1.0` but provides `girepository-2.0` features. If this returns an error, the `-dev` package is not correctly installed.*
+
+2. **Check for Meson path issues:**
+   If using a virtual environment, ensure you are not running into a path conflict. Try installing it globally first to verify:
+   ```bash
+   sudo apt-get install python3-gi
+   ```
 
 ### Get Raw Temperature Data
 

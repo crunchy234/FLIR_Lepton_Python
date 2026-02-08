@@ -7,8 +7,13 @@ spidev>=3.5
 numpy>=1.21.0
 
 # Optional: For image processing and display
-# opencv-python>=4.5.0  # Uncomment if you need OpenCV for display/processing
-# Pillow>=8.0.0  # Uncomment if you need PIL for image handling
+opencv-python>=4.5.0
+Pillow>=8.0.0
+
+# Optional: For RTSP streaming
+# NOTE: Requires system dependencies first: sudo apt install gstreamer1.0-plugins-ugly libgirepository-2.0-dev gcc libcairo2-dev pkg-config python3-dev
+# Then install PyGObject manually if needed. Commented out to prevent pip install failures.
+PyGObject>=3.42.0
 
 # Optional: For I2C communication (future CCI implementation)
-# smbus2>=0.4.0  # Uncomment for I2C/CCI control features
+smbus2>=0.4.0  # Uncomment for I2C/CCI control features
