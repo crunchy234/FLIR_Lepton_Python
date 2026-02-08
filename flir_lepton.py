@@ -65,6 +65,7 @@ class FLIRLepton35:
     # SPI packet format
     PACKET_HEADER_SIZE = 4
     PACKET_DATA_SIZE = 160
+    PACKET_SIZE_UINT16 = 82  # PACKET_SIZE / 2 = 164 / 2
 
     # Discard packet ID (used for resync)
     DISCARD_PACKET_ID = 0x0F
@@ -162,103 +163,137 @@ class FLIRLepton35:
             LeptonCommunicationError: If packet read fails
         """
         try:
-            packet = bytes(self.spi.readbytes(self.PACKET_SIZE))
+            # Use xfer2 for more consistent timing on Pi 5
+            packet = bytes(self.spi.xfer2([0] * self.PACKET_SIZE))
 
             # Extract packet number from header
-            # Byte 0 contains ID field, Byte 1 contains CRC
+            # Byte 0 and 1 contain ID field (16 bits)
+            # Bits 15-12: reserved
+            # Bits 11-8: segment ID (if packet 20)
+            # Bits 7-0: packet number
+            
+            # However, Lepton header is Big Endian
+            # [0] is ID MSB, [1] is ID LSB (packet number)
+            # Wait, standard VoSPI:
+            # Byte 0: ID MSB (reserved:4, segment:4) - actually segment is bits 4-6
+            # Byte 1: ID LSB (packet number)
+            # Byte 2-3: CRC
+            
             packet_id = packet[0]
             packet_number = packet[1]
-            segment_id = (packet_id >> 4) & 0x07
-
-            # Extract data portion (skip 4-byte header)
-            packet_data = packet[self.PACKET_HEADER_SIZE:]
-
-            return packet_id, segment_id, packet_number, packet_data
+            
+            # The VoSPI spec says:
+            # If (packet[0] & 0x0F) == 0x0F, it's a discard packet.
+            
+            return packet_id, 0, packet_number, packet[self.PACKET_HEADER_SIZE:]
         except Exception as e:
             raise LeptonCommunicationError(f"Failed to read SPI packet: {str(e)}")
 
-    def _capture_frame_raw(self, max_retries: int = 10) -> Optional[np.ndarray]:
+    def _capture_frame_raw(self, max_retries: int = 50, debug: bool = False) -> Optional[np.ndarray]:
         """
         Capture a raw frame from the Lepton camera.
-
-        Args:
-            max_retries: Maximum number of frame capture attempts
-
-        Returns:
-            numpy array of shape (120, 160) containing 16-bit thermal data,
-            or None if capture fails
         """
         for retry in range(max_retries):
             try:
-                # Initialize segment buffers
-                segments = {
-                    1: [None] * self.PACKETS_PER_SEGMENT,
-                    2: [None] * self.PACKETS_PER_SEGMENT,
-                    3: [None] * self.PACKETS_PER_SEGMENT,
-                    4: [None] * self.PACKETS_PER_SEGMENT,
-                }
+                segments = {1: None, 2: None, 3: None, 4: None}
                 segments_seen = set()
-                discard_count = 0
-                packets_read = 0
-                max_packets = self.PACKETS_PER_SEGMENT * self.SEGMENTS_PER_FRAME * 5
-
-                # Read packets until we get a complete frame
-                while packets_read < max_packets:
-                    packet_id, segment_id, packet_number, packet_data = self._read_packet()
-                    packets_read += 1
-
-                    # Check for discard packet (resync needed)
-                    if (packet_id & 0x0F) == self.DISCARD_PACKET_ID:
-                        discard_count += 1
-                        if discard_count > 750:  # Timeout after many discards
+                
+                # Lepton 3.5 sends 4 segments to form one 160x120 frame
+                # We need to collect all 4 unique segments
+                
+                max_packets_to_read = self.PACKETS_PER_SEGMENT * 20 # Safety margin
+                packets_read_total = 0
+                
+                while len(segments_seen) < 4 and packets_read_total < max_packets_to_read:
+                    # Read packets until we find a valid packet 0
+                    pkt0_raw = self.spi.xfer2([0] * self.PACKET_SIZE)
+                    packets_read_total += 1
+                    
+                    # If it's a discard packet, skip it
+                    if (pkt0_raw[0] & 0x0F) == 0x0F:
+                        continue
+                        
+                    # Packet number is in the second byte
+                    if pkt0_raw[1] != 0:
+                        # If we're not at the start of a segment, keep looking
+                        # Small delay helps avoid hammering the SPI bus if out of sync
+                        time.sleep(0.001)
+                        continue
+                        
+                    # Found packet 0, now read the rest of the segment (60 packets total)
+                    current_segment_packets = [pkt0_raw]
+                    valid_segment = True
+                    segment_id = -1
+                    
+                    for i in range(1, 60):
+                        pkt = self.spi.xfer2([0] * self.PACKET_SIZE)
+                        packets_read_total += 1
+                        if pkt[1] != i:
+                            if debug:
+                                print(f"Sync lost: expected packet {i}, got {pkt[1]}")
+                            valid_segment = False
                             break
-                        time.sleep(0.001)  # Short delay for resync
+                        current_segment_packets.append(pkt)
+                        if i == 20:
+                            # Segment ID is in bits 4-6 of the first byte of packet 20
+                            segment_id = (pkt[0] >> 4) & 0x07 # 0x07 because it's 3 bits (1-4)
+                    
+                    if not valid_segment:
+                        # If sync was lost, wait a bit and look for the next packet 0
+                        time.sleep(0.001)
                         continue
-
-                    if segment_id not in segments:
+                    
+                    # Validate segment ID (must be 1, 2, 3, or 4 for Lepton 3.x)
+                    if segment_id < 1 or segment_id > 4:
                         continue
-
-                    if packet_number == 0:
-                        segments[segment_id] = [None] * self.PACKETS_PER_SEGMENT
+                        
+                    if segment_id not in segments_seen:
+                        segments[segment_id] = current_segment_packets
                         segments_seen.add(segment_id)
-
-                    if packet_number < self.PACKETS_PER_SEGMENT:
-                        segments[segment_id][packet_number] = packet_data
-
-                    if len(segments_seen) == self.SEGMENTS_PER_FRAME:
-                        if all(all(p is not None for p in segments[sid]) for sid in segments_seen):
-                            break
-
-                # Check if we got a complete frame across all segments
-                if len(segments_seen) == self.SEGMENTS_PER_FRAME and all(
-                    all(p is not None for p in segments[sid]) for sid in segments_seen
-                ):
-                    segment_arrays = {}
-                    for sid in range(1, self.SEGMENTS_PER_FRAME + 1):
-                        segment_bytes = b''.join(segments[sid])
-                        segment_array = np.frombuffer(segment_bytes, dtype='>u2')
-                        segment_arrays[sid] = segment_array.reshape((self.PACKETS_PER_SEGMENT, 80))
-
-                    top = np.hstack((segment_arrays[1], segment_arrays[2]))
-                    bottom = np.hstack((segment_arrays[3], segment_arrays[4]))
-                    image_data = np.vstack((top, bottom))
-
+                        if debug:
+                            print(f"Captured segment {segment_id}")
+                
+                if len(segments_seen) == 4:
+                    # Assemble the 160x120 frame from the 4 segments
+                    image_data = np.zeros((self.IMAGE_HEIGHT, self.IMAGE_WIDTH), dtype=np.uint16)
+                    
+                    for sid in range(1, 5):
+                        packets = segments[sid]
+                        for p_idx, pkt in enumerate(packets):
+                            # Each packet has 160 bytes of data (80 pixels)
+                            # Row calculation for Lepton 3.5:
+                            # Each segment has 60 packets. 
+                            # Each row (160 pixels) is split across two packets.
+                            # So 60 packets / 2 = 30 rows per segment.
+                            # 30 rows * 4 segments = 120 rows total.
+                            
+                            row = (p_idx // 2) + (sid - 1) * 30
+                            col_start = 80 * (p_idx % 2)
+                            
+                            packet_data = pkt[self.PACKET_HEADER_SIZE:]
+                            row_pixels = np.frombuffer(bytes(packet_data), dtype='>u2')
+                            image_data[row, col_start:col_start+80] = row_pixels
+                            
                     return image_data
+                elif debug:
+                    print(f"Failed to capture all segments. Seen: {segments_seen}")
 
-            except LeptonCommunicationError:
-                if retry == max_retries - 1:
-                    raise
-                time.sleep(0.1)  # Wait before retry
+            except Exception as e:
+                if debug:
+                    print(f"Error during capture attempt: {e}")
+                time.sleep(0.005)
+                continue
 
         return None
 
-    def capture_frame(self, normalize: bool = True) -> Optional[np.ndarray]:
+    def capture_frame(self, normalize: bool = True, debug: bool = False) -> Optional[np.ndarray]:
         """
         Capture a thermal frame from the camera.
 
         Args:
             normalize: If True, normalize the output to 0-255 range (uint8)
                       If False, return raw 16-bit thermal data
+            debug: If True, enable debug logging during capture
 
         Returns:
             numpy array containing thermal image data
@@ -266,7 +301,7 @@ class FLIRLepton35:
             - If normalize=False: shape (120, 160) dtype uint16
             Returns None if capture fails
         """
-        frame = self._capture_frame_raw()
+        frame = self._capture_frame_raw(debug=debug)
 
         if frame is None:
             return None
@@ -424,7 +459,8 @@ if __name__ == "__main__":
 
             # Capture a single frame
             print("Capturing test frame...")
-            frame = camera.capture_frame()
+            # Use higher max_retries and debug mode for the CLI test
+            frame = camera.capture_frame(debug=True)
 
             if frame is not None:
                 print(f"Frame captured successfully!")
