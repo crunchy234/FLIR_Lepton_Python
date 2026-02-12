@@ -17,3 +17,5 @@ PyGObject>=3.42.0
 
 # Optional: For I2C communication (future CCI implementation)
 smbus2>=0.4.0  # Uncomment for I2C/CCI control features
+
+gpiod>=2.4.0
