@@ -136,7 +136,7 @@ def main():
     print("=" * 50)
 
     try:
-        camera = FLIRLepton35()
+        camera = FLIRLepton35(vsync_gpio=17, reset_gpio=27)
         print("✓ Camera initialized")
 
         # Start background frame capture

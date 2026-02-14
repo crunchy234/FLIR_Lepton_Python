@@ -66,6 +66,9 @@ class LeptonI2C:
     CMD_OEM_REBOOT = 0x4842       # OEM Run Reboot
     CMD_SYS_RUN_FFC = 0x0242      # SYS Run FFC Normalization
     CMD_SYS_STATUS = 0x0204       # SYS Get Status
+    CMD_OEM_GPIO_MODE_SET = 0x4854  # OEM Set GPIO Mode
+    CMD_OEM_GPIO_MODE_GET = 0x4855  # OEM Get GPIO Mode
+    CMD_OEM_GPIO_VSYNC_PHASE_DELAY_SET = 0x4858  # OEM Set GPIO VSync Phase Delay
 
     # Status bits
     STATUS_BUSY_BIT = 0x01
@@ -172,6 +175,56 @@ class LeptonI2C:
             print(f"I2C FFC command failed: {e}")
             return False
 
+    def configure_gpio_vsync(self) -> bool:
+        """
+        Configure GPIO3 as VSYNC output.
+
+        Note: The Lepton SDK configures GPIO3 for VSYNC by default.
+        This command sets the GPIO mode to VSYNC (mode 5).
+
+        Returns:
+            True if configuration succeeded, False otherwise
+        """
+        if not self.available:
+            return False
+        try:
+            self._wait_busy()
+
+            # GPIO Mode values (from Lepton SDK):
+            # 0 = LEP_OEM_GPIO_MODE_GPIO
+            # 1 = LEP_OEM_GPIO_MODE_I2C_MASTER
+            # 2 = LEP_OEM_GPIO_MODE_SPI_MASTER_VLB_DATA
+            # 3 = LEP_OEM_GPIO_MODE_SPIO_MASTER_REG_DATA
+            # 4 = LEP_OEM_GPIO_MODE_SPI_SLAVE_VLB_DATA
+            # 5 = LEP_OEM_GPIO_MODE_VSYNC (what we want)
+            gpio_mode = 5  # VSYNC mode
+
+            # Data format: 32-bit enum value (stored as 2x 16-bit words)
+            # SDK sends this as a 32-bit little-endian value
+
+            # Write to data registers as two 16-bit words
+            # Word 0 (lower 16 bits): mode value
+            # Word 1 (upper 16 bits): 0 (padding for 32-bit enum)
+            self.bus.write_word_data(self.LEPTON_I2C_ADDRESS, self.REG_DATA_0,
+                                    self._swap16(gpio_mode & 0xFFFF))
+            self.bus.write_word_data(self.LEPTON_I2C_ADDRESS, self.REG_DATA_0 + 2,
+                                    self._swap16(0))
+
+            # Write data length (2 words = 4 bytes)
+            self.bus.write_word_data(self.LEPTON_I2C_ADDRESS, self.REG_DATA_LENGTH,
+                                    self._swap16(2))
+
+            # Write command ID to trigger the operation
+            self.bus.write_word_data(self.LEPTON_I2C_ADDRESS, self.REG_COMMAND_ID,
+                                    self._swap16(self.CMD_OEM_GPIO_MODE_SET))
+
+            self._wait_busy()
+            print("GPIO3 configured as VSYNC output")
+            return True
+        except Exception as e:
+            print(f"Failed to configure GPIO as VSYNC: {e}")
+            return False
+
     def close(self):
         if self.bus is not None:
             self.bus.close()
@@ -263,6 +316,10 @@ class FLIRLepton35:
         # Initialize I2C for CCI commands (reboot, FFC)
         self.i2c = LeptonI2C(i2c_bus)
 
+        # Configure VSYNC on Lepton's GPIO3 if VSYNC is enabled
+        if vsync_gpio is not None and self.i2c.available:
+            self.i2c.configure_gpio_vsync()
+
         self._initialize_spi()
         self._initialize_gpio()
 
@@ -312,32 +369,52 @@ class FLIRLepton35:
         except Exception as e:
             raise LeptonCommunicationError(f"Failed to initialize SPI: {str(e)}")
 
+    # noinspection PyTypeChecker
     def _initialize_gpio(self) -> None:
-        """Initialize GPIO for VSYNC and/or RESET_L if configured."""
+        """Initialize GPIO for VSYNC and/or RESET_L if configured (Pi 5 compatible via gpiod)."""
         if self.vsync_gpio is None and self.reset_gpio is None:
             return
         try:
             import gpiod
-            chip = gpiod.Chip('gpiochip4')
+            from gpiod.line import Direction, Edge, Value
+
+            chip = gpiod.Chip('/dev/gpiochip4')
+
+            line_configs = {}
 
             if self.vsync_gpio is not None:
-                vsync_line = chip.get_line(self.vsync_gpio)
-                vsync_line.request(consumer="lepton_vsync", type=gpiod.LINE_REQ_EV_RISING_EDGE)
-                self._vsync_line = vsync_line
+                line_configs[self.vsync_gpio] = gpiod.LineSettings(
+                    direction=Direction.INPUT,
+                    edge_detection=Edge.RISING,
+                )
+
+            if self.reset_gpio is not None:
+                line_configs[self.reset_gpio] = gpiod.LineSettings(
+                    direction=Direction.OUTPUT,
+                    output_value=Value.ACTIVE,  # HIGH — device operates
+                )
+
+            request = chip.request_lines(
+                consumer="flir_lepton",
+                config=line_configs,
+            )
+
+            self._gpio = request  # gpiod.LineRequest object
+
+            if self.vsync_gpio is not None:
+                self._vsync_line = self.vsync_gpio
                 print(f"VSYNC configured on GPIO {self.vsync_gpio}")
 
             if self.reset_gpio is not None:
-                reset_line = chip.get_line(self.reset_gpio)
-                reset_line.request(consumer="lepton_reset", type=gpiod.LINE_REQ_DIR_OUT,
-                                   default_val=1)
-                self._reset_line = reset_line
-                print(f"RESET_L configured on GPIO {self.reset_gpio}")
+                self._reset_line = self.reset_gpio
+                print(f"RESET_L configured and verified on GPIO {self.reset_gpio}")
 
-            self._gpio = chip
         except ImportError:
-            print("Warning: gpiod not installed. GPIO features unavailable.")
+            print("ERROR: gpiod not installed. GPIO features (VSYNC/RESET) unavailable.")
+            print("  Install with: pip install gpiod")
         except Exception as e:
-            print(f"Warning: GPIO init failed: {e}")
+            print(f"ERROR: GPIO init failed: {e}")
+            print("  Verify /dev/gpiochip4 exists: ls /dev/gpiochip*")
 
     def _open_spi(self):
         """Open and configure SPI (helper to avoid repetition)."""
@@ -363,11 +440,11 @@ class FLIRLepton35:
 
     def _hard_reset(self) -> bool:
         """Perform a hardware reset by pulling RESET_L low."""
-        if self._reset_line is not None:
+        if self._reset_line is not None and self._gpio is not None:
             print("Performing hardware reset via RESET_L pin...")
-            self._reset_line.set_value(0)
-            time.sleep(0.01)
-            self._reset_line.set_value(1)
+            self._gpio.output(self._reset_line, self._gpio.LOW)
+            time.sleep(0.015)
+            self._gpio.output(self._reset_line, self._gpio.HIGH)
             time.sleep(5.0)
             self._resync_vospi()
             return True
@@ -403,13 +480,12 @@ class FLIRLepton35:
 
     def _wait_for_vsync(self, timeout_ms: int = 200) -> bool:
         """Wait for VSYNC rising edge if VSYNC GPIO is configured."""
-        if self._vsync_line is None:
+        if self._vsync_line is None or self._gpio is None:
             return False
         try:
-            event = self._vsync_line.event_wait(nsec=timeout_ms * 1_000_000)
-            if event:
-                self._vsync_line.event_read()
-                return True
+            # Wait for the rising edge with timeout
+            channel = self._gpio.wait_for_edge(self._vsync_line, self._gpio.RISING, timeout=timeout_ms)
+            return channel is not None
         except Exception:
             pass
         return False
@@ -718,11 +794,13 @@ class FLIRLepton35:
         if getattr(self, 'i2c', None) is not None:
             self.i2c.close()
             self.i2c = None
-        if getattr(self, '_reset_line', None) is not None:
-            self._reset_line.release()
+        if getattr(self, '_gpio', None) is not None:
+            try:
+                self._gpio.cleanup()
+            except Exception:
+                pass
+            self._gpio = None
             self._reset_line = None
-        if getattr(self, '_vsync_line', None) is not None:
-            self._vsync_line.release()
             self._vsync_line = None
         print("Connections closed")
 
@@ -794,7 +872,7 @@ if __name__ == "__main__":
 
     print("Testing camera connection...")
     try:
-        with FLIRLepton35() as camera:
+        with FLIRLepton35(vsync_gpio=17, reset_gpio=27) as camera:
             print("Camera initialized successfully!")
             print()
 
